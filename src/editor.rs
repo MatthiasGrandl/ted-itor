@@ -9,7 +9,9 @@ pub struct Editor {
 
 impl Editor {
     pub fn clear(self, cx: &mut WindowContext) {
-        self.text_input.clear(cx);
+        self.text_input.model.update(cx, |editor, cx| {
+            editor.reset(cx);
+        })
     }
 }
 

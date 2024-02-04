@@ -176,43 +176,124 @@ impl Styled for Button {
 
 #[derive(IntoElement, Clone)]
 pub struct TextInput {
-    pub text_display_view: View<TextDisplay>,
     focus_handle: FocusHandle,
+    view: View<TextDisplay>,
+    pub model: Model<TextModel>,
 }
 
 impl TextInput {
     pub fn new(cx: &mut WindowContext, initial_text: String) -> Self {
-        let i = initial_text.len();
+        let model = TextModel::init(initial_text.clone(), cx);
+        let clone = model.clone();
+        let view = cx.new_view(move |cx| {
+            let view = TextDisplay {
+                model: clone.clone(),
+            };
+            cx.subscribe(&clone, |_subscriber, _emitter, event, cx| match event {
+                TextEvent::Input { text: _ } => {
+                    cx.notify();
+                }
+                _ => {}
+            })
+            .detach();
+            view
+        });
         Self {
-            text_display_view: cx.new_view(|_cx| TextDisplay {
-                text: initial_text,
-                selection: i..i,
-                word_click: Arc::new(Mutex::new((0, 0))),
-            }),
             focus_handle: cx.focus_handle(),
+            view,
+            model,
         }
-    }
-
-    pub fn clear(self, cx: &mut WindowContext) {
-        self.text_display_view.update(cx, |text_display, cx| {
-            text_display.text = String::from("");
-            cx.notify();
-        })
     }
 }
 
+pub struct TextModel {
+    pub text: String,
+    pub selection: Range<usize>,
+    pub word_click: (usize, u16),
+}
+
+impl TextModel {
+    pub fn init(text: String, cx: &mut WindowContext) -> Model<Self> {
+        let i = text.len();
+        let m = Self {
+            text,
+            selection: i..i,
+            word_click: (0, 0),
+        };
+        let model = cx.new_model(|_cx| m);
+        cx.subscribe(
+            &model,
+            |subscriber, emitter: &TextEvent, cx| match emitter {
+                TextEvent::Input { text: _ } => {
+                    subscriber.update(cx, |editor, _cx| {
+                        editor.word_click = (0, 0);
+                    });
+                }
+                _ => {}
+            },
+        )
+        .detach();
+        model
+    }
+    pub fn reset(&mut self, cx: &mut ModelContext<Self>) {
+        self.text = "".to_string();
+        self.selection = 0..0;
+        cx.notify();
+        cx.emit(TextEvent::Input {
+            text: self.text.clone(),
+        });
+    }
+    pub fn word_ranges(&self) -> Vec<Range<usize>> {
+        let mut words = Vec::new();
+        let mut last_was_boundary = true;
+        let mut word_start = 0;
+        let s = self.text.clone();
+
+        for (i, c) in s.char_indices() {
+            if c.is_alphanumeric() || c == '_' {
+                if last_was_boundary {
+                    word_start = i;
+                }
+                last_was_boundary = false;
+            } else {
+                if !last_was_boundary {
+                    words.push(word_start..i);
+                }
+                last_was_boundary = true;
+            }
+        }
+
+        // Check if the last characters form a word and push it if so
+        if !last_was_boundary {
+            words.push(word_start..s.len());
+        }
+
+        words
+    }
+}
+
+pub enum TextEvent {
+    Input { text: String },
+    Movement(TextMovement),
+}
+pub enum TextMovement {
+    Up,
+    Down,
+}
+
+impl EventEmitter<TextEvent> for TextModel {}
+
 impl RenderOnce for TextInput {
     fn render(self, cx: &mut WindowContext) -> impl IntoElement {
-        let theme = cx.global::<Theme>();
+        cx.focus(&self.focus_handle);
 
-        let text_display_view = self.text_display_view.clone();
+        let theme = cx.global::<Theme>();
 
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(move |ev, cx| {
-                text_display_view.update(cx, |editor, cx| {
+                self.model.update(cx, |editor, cx| {
                     let keystroke = &ev.keystroke.key;
-
                     if ev.keystroke.modifiers.command {
                         match keystroke.as_str() {
                             "a" => {
@@ -247,6 +328,14 @@ impl RenderOnce for TextInput {
                         editor.selection = i..i;
                     } else {
                         match keystroke.as_str() {
+                            "up" => {
+                                cx.emit(TextEvent::Movement(TextMovement::Up));
+                                return;
+                            }
+                            "down" => {
+                                cx.emit(TextEvent::Movement(TextMovement::Down));
+                                return;
+                            }
                             "left" => {
                                 if editor.selection.start > 0 {
                                     let i = if editor.selection.start == editor.selection.end {
@@ -271,6 +360,7 @@ impl RenderOnce for TextInput {
                                 if editor.selection.start == editor.selection.end
                                     && editor.selection.start > 0
                                 {
+                                    // necessary for non-ascii characters
                                     let mut start = editor.text[..editor.selection.start].chars();
                                     start.next_back();
                                     let start = start.as_str();
@@ -288,101 +378,84 @@ impl RenderOnce for TextInput {
                                 let i = editor.selection.start + 1;
                                 editor.selection = i..i;
                             }
+                            "escape" => {
+                                cx.hide();
+                            }
                             keystroke_str => {
                                 eprintln!("Unhandled keystroke {keystroke_str}")
                             }
                         };
                     }
-
-                    cx.notify();
+                    cx.emit(TextEvent::Input {
+                        text: editor.text.clone(),
+                    });
                 });
             })
             .p_4()
-            .border_l()
-            .border_color(transparent_black())
-            .focus(|style| style.border_color(theme.border_color))
-            .child(self.text_display_view)
+            .w_full()
+            .border_1()
+            .border_color(theme.border_color)
+            .text_color(theme.text_color)
+            .focus(|style| style.border_color(theme.primary_color))
+            .child(self.view)
     }
 }
 
-#[derive(Clone)]
 pub struct TextDisplay {
-    // TODO: Use Arc<String>? Other places we can reduce clones?
-    pub text: String,
-    pub selection: Range<usize>,
-    pub word_click: Arc<Mutex<(usize, u16)>>,
-}
-
-fn split_into_words(s: &str) -> Vec<Range<usize>> {
-    let mut words = Vec::new();
-    let mut last_was_boundary = true;
-    let mut word_start = 0;
-
-    for (i, c) in s.char_indices() {
-        if c.is_alphanumeric() || c == '_' {
-            if last_was_boundary {
-                word_start = i;
-            }
-            last_was_boundary = false;
-        } else {
-            if !last_was_boundary {
-                words.push(word_start..i);
-            }
-            last_was_boundary = true;
-        }
-    }
-
-    // Check if the last characters form a word and push it if so
-    if !last_was_boundary {
-        words.push(word_start..s.len());
-    }
-
-    words
+    model: Model<TextModel>,
 }
 
 impl Render for TextDisplay {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let text = self.text.clone();
+        let theme = cx.global::<Theme>();
+
+        let mut text = self.model.read(cx).text.clone();
         let mut selection_style = HighlightStyle::default();
+
         selection_style.background_color = Some(hsla(0., 0., 0.9, 1.));
 
-        let sel = self.selection.clone();
-        let highlights = vec![(sel, selection_style)];
-        let word_ranges = split_into_words(text.as_str());
-        let word_ranges_clone = word_ranges.clone();
-        let styled_text =
-            StyledText::new(text + " ").with_highlights(&TextStyle::default(), highlights);
-        let view = cx.view().clone();
-        let clicked = self.word_click.clone();
+        let sel = self.model.read(cx).selection.clone();
+        let mut highlights = vec![(sel, selection_style)];
 
-        InteractiveText::new("text", styled_text).on_click(word_ranges, move |ev, cx| {
-            let mut c = clicked.lock().unwrap();
-            if c.0 == ev {
-                *c = (ev, c.1 + 1);
-            } else {
-                *c = (ev, 1);
-            }
+        let mut style = TextStyle::default();
+        style.color = theme.text_color;
+        if text.len() == 0 {
+            text = "Type here...".to_string();
+            style.color = theme.text_color;
+            highlights = vec![];
+        }
 
-            match c.1 {
-                2 => {
-                    cx.update_view(&view, |editor, cx| {
-                        editor.selection = word_ranges_clone[ev].clone();
-                        cx.notify();
-                    });
-                }
-                3 => {
-                    // Should select the line
-                }
-                4 => {
-                    *c = (0, 0);
-                    cx.update_view(&view, |editor, cx| {
-                        editor.selection = 0..editor.text.len();
-                        cx.notify();
-                    });
-                }
-                _ => {}
-            }
-        })
+        let styled_text = StyledText::new(text + " ").with_highlights(&style, highlights);
+        let clone = self.model.clone();
+        InteractiveText::new("text", styled_text).on_click(
+            self.model.read(cx).word_ranges(),
+            move |ev, cx| {
+                clone.update(cx, |editor, cx| {
+                    let (index, mut count) = editor.word_click;
+                    if index == ev {
+                        count += 1;
+                    } else {
+                        count = 1;
+                    }
+                    match count {
+                        2 => {
+                            let word_ranges = editor.word_ranges();
+                            editor.selection = word_ranges.get(ev).unwrap().clone();
+                        }
+                        3 => {
+                            // Should select the line
+                        }
+                        4 => {
+                            count = 0;
+                            editor.selection = 0..editor.text.len();
+                        }
+                        _ => {}
+                    }
+                    editor.word_click = (ev, count);
+                    cx.notify();
+                });
+            },
+        )
     }
 }
 
